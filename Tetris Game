@@ -1,0 +1,214 @@
+import random
+import pickle
+import pygame
+import sys
+
+# ---- Constants ----
+CELL_SIZE = 20
+GRID_WIDTH = 10
+GRID_HEIGHT = 20
+STEP_PENALTY = -0.05
+GAME_OVER_PENALTY = -50
+
+COLOR_BACKGROUND = (255, 255, 255)
+COLOR_BLOCK = (255, 0, 0)
+COLOR_BORDER = (0, 0, 0)
+
+FIGURES = [
+    [[1, 5, 9, 13], [4, 5, 6, 7]],               # I
+    [[4, 5, 9, 10], [2, 6, 5, 9]],               # Z
+    [[6, 7, 9, 10], [1, 5, 6, 10]],              # S
+    [[1, 2, 5, 9], [0, 4, 5, 6], [1, 5, 9, 8], [4, 5, 6, 10]],  # L
+    [[1, 2, 6, 10], [5, 6, 7, 9], [2, 6, 10, 11], [3, 5, 6, 7]], # J
+    [[1, 4, 5, 6], [1, 4, 5, 9], [4, 5, 6, 9], [1, 5, 6, 9]],    # T
+    [[1, 2, 5, 6]]                                # O
+]
+
+def extract_features(field):
+    heights = []
+    for c in range(GRID_WIDTH):
+        h = 0
+        for r in range(GRID_HEIGHT):
+            if field[r][c]:
+                h = GRID_HEIGHT - r
+                break
+        heights.append(h)
+    agg_height = sum(heights)
+    holes = sum(
+        1 for c in range(GRID_WIDTH)
+        for r in range(GRID_HEIGHT - heights[c], GRID_HEIGHT)
+        if field[r][c] == 0
+    )
+    bumpiness = sum(abs(heights[c] - heights[c+1]) for c in range(GRID_WIDTH - 1))
+    return agg_height, holes, bumpiness
+
+def calculate_reward(lines_cleared, before, after):
+    agg_bef, holes_bef, bump_bef = extract_features(before)
+    agg_aft, holes_aft, bump_aft = extract_features(after)
+    delta_agg = agg_aft - agg_bef
+    delta_holes = holes_aft - holes_bef
+    delta_bump = bump_aft - bump_bef
+    return lines_cleared - 0.3 * delta_agg - 0.7 * delta_holes - 0.5 * delta_bump
+
+class TetrisEnv:
+    def __init__(self):
+        self.width = GRID_WIDTH
+        self.height = GRID_HEIGHT
+        self.figures = FIGURES
+        self.reset()
+
+    def reset(self):
+        self.field = [[0] * self.width for _ in range(self.height)]
+        self.spawn_new()
+        return self.get_state()
+
+    def spawn_new(self):
+        self.figure = {
+            'type': random.randrange(len(self.figures)),
+            'rotation': 0,
+            'x': self.width // 2 - 2,
+            'y': 0
+        }
+
+    def intersects(self):
+        shape = self.figures[self.figure['type']][self.figure['rotation']]
+        for i in range(4):
+            for j in range(4):
+                if i*4 + j in shape:
+                    x = self.figure['x'] + j
+                    y = self.figure['y'] + i
+                    if x < 0 or x >= self.width or y < 0 or y >= self.height or self.field[y][x]:
+                        return True
+        return False
+
+    def break_lines(self):
+        new_field = [row for row in self.field if any(cell == 0 for cell in row)]
+        cleared = self.height - len(new_field)
+        for _ in range(cleared):
+            new_field.insert(0, [0] * self.width)
+        self.field = new_field
+        return cleared
+
+    def freeze(self):
+        shape = self.figures[self.figure['type']][self.figure['rotation']]
+        for i in range(4):
+            for j in range(4):
+                if i*4 + j in shape:
+                    self.field[self.figure['y'] + i][self.figure['x'] + j] = 1
+        return self.break_lines()
+
+    def step(self, action):
+        before = [row[:] for row in self.field]
+        reward = STEP_PENALTY
+        old_x, old_rot = self.figure['x'], self.figure['rotation']
+
+        if action == 1:
+            self.figure['x'] -= 1
+            if self.intersects():
+                self.figure['x'] = old_x
+        elif action == 2:
+            self.figure['x'] += 1
+            if self.intersects():
+                self.figure['x'] = old_x
+        elif action == 3:
+            self.figure['rotation'] = (old_rot + 1) % len(self.figures[self.figure['type']])
+            if self.intersects():
+                self.figure['rotation'] = old_rot
+
+        self.figure['y'] += 1
+        if self.intersects():
+            self.figure['y'] -= 1
+            lines = self.freeze()
+            after = [row[:] for row in self.field]
+            reward += calculate_reward(lines, before, after)
+            self.spawn_new()
+            if self.intersects():
+                return self.get_state(), reward + GAME_OVER_PENALTY, True
+            return self.get_state(), reward, False
+
+        return self.get_state(), reward, False
+
+    def get_state(self):
+        heights = []
+        for c in range(self.width):
+            h = 0
+            for r in range(self.height):
+                if self.field[r][c]:
+                    h = self.height - r
+                    break
+            heights.append(h)
+        return tuple(heights) + (self.figure['type'], self.figure['rotation'], self.figure['x'])
+
+def choose_action(state, Q, eps):
+    if random.random() < eps:
+        return random.randrange(4)
+    values = [Q.get((state, a), 0) for a in range(4)]
+    max_val = max(values)
+    return random.choice([i for i, v in enumerate(values) if v == max_val])
+
+def train_agent(episodes=200000, alpha=0.1, gamma=0.99, eps_start=1.0, eps_min=0.01, decay=0.99999):
+    env = TetrisEnv()
+    Q = {}
+    eps = eps_start
+    for ep in range(1, episodes + 1):
+        state = env.reset()
+        total_reward = 0
+        done = False
+        while not done:
+            action = choose_action(state, Q, eps)
+            nxt, reward, done = env.step(action)
+            total_reward += reward
+            old_q = Q.get((state, action), 0)
+            future = max(Q.get((nxt, a), 0) for a in range(4))
+            Q[(state, action)] = old_q + alpha * (reward + gamma * future - old_q)
+            state = nxt
+        eps = max(eps_min, eps * decay)
+        if ep % 1000 == 0:
+            print(f"Episode {ep} | TotalReward {total_reward:.3f} | Epsilon {eps:.4f}")
+    return Q
+
+def play_game(Q):
+    env = TetrisEnv()
+    pygame.init()
+    screen = pygame.display.set_mode((GRID_WIDTH * CELL_SIZE, GRID_HEIGHT * CELL_SIZE))
+    clock = pygame.time.Clock()
+    state = env.reset()
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+        action = choose_action(state, Q, eps=0.0)
+        state, _, done = env.step(action)
+        screen.fill(COLOR_BACKGROUND)
+
+        for y, row in enumerate(env.field):
+            for x, val in enumerate(row):
+                if val:
+                    rect = pygame.Rect(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+                    pygame.draw.rect(screen, COLOR_BLOCK, rect)
+                    pygame.draw.rect(screen, COLOR_BORDER, rect, 1)
+
+        shape = FIGURES[env.figure['type']][env.figure['rotation']]
+        for i in range(4):
+            for j in range(4):
+                if i * 4 + j in shape:
+                    px = env.figure['x'] + j
+                    py = env.figure['y'] + i
+                    rect = pygame.Rect(px * CELL_SIZE, py * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+                    pygame.draw.rect(screen, COLOR_BLOCK, rect)
+                    pygame.draw.rect(screen, COLOR_BORDER, rect, 1)
+
+        pygame.display.flip()
+        clock.tick(10)
+
+        if done:
+            pygame.time.wait(300)
+            state = env.reset()
+
+if __name__ == "__main__":
+    with open('q_table.pkl', 'wb') as f:
+        pickle.dump(Q, f)
+    print("Training complete.")
+    play_game(Q)
